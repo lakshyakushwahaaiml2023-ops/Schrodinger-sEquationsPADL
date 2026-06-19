@@ -106,5 +106,9 @@ tdse_padl/
 
 ---
 
-## Connection to PAGF-Net
-The PADL framework shares its foundational **physics-aware** core principle with **PAGF-Net** (Physics-Aware Green's Function Network). Both architectures recognize that pure deep-learning surrogates struggle with cumulative physical drift (like norm decay or phase loss). Just as PAGF-Net embeds analytical Green's functions or boundary constraints to structure the learning space, PADL uses periodic Crank-Nicolson anchoring and conservation-law projection to keep predictions bound to the underlying quantum mechanics.
+
+
+
+https://github.com/user-attachments/assets/40cd7aab-fde3-40a5-842f-ecf37190ba19
+
+

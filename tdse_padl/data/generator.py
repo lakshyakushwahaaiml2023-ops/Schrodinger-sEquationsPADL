@@ -138,8 +138,8 @@ class TrajectoryGenerator:
         self,
         N: int   = 512,
         L: float = 1.0,
-        dt: float = 1e-5,
-        skip: int = 5,
+        dt: float = 2e-5,
+        skip: int = 10,
         device: str = 'cpu',
         seed: int | None = None,
     ) -> None:
@@ -405,6 +405,11 @@ class QuantumDataset(Dataset):
         Path to an HDF5 file produced by TrajectoryGenerator.generate_dataset().
     augment : bool, optional
         Enable random spatial-flip augmentation (default True).
+    preload : bool, optional
+        If True (default), load the entire dataset into RAM as contiguous
+        numpy arrays at construction time.  This eliminates per-sample HDF5
+        disk seeks and reduces epoch time from minutes to seconds.  Set to
+        False only when RAM is insufficient (>1 GB needed for 80 k samples).
 
     Attributes
     ----------
@@ -414,18 +419,36 @@ class QuantumDataset(Dataset):
         Number of spatial grid points (read from HDF5 attributes).
     """
 
-    def __init__(self, h5_path: str, augment: bool = True) -> None:
+    def __init__(self, h5_path: str, augment: bool = True, preload: bool = True) -> None:
         super().__init__()
         self.h5_path = h5_path
         self.augment = augment
+        self._preloaded = preload
 
-        # Open file once to read metadata; keep it open for __getitem__
+        # Open file to read metadata (and optionally bulk-load data)
         self._file   = h5py.File(h5_path, 'r')
-        self._inputs  = self._file['inputs']   # HDF5 dataset (lazy)
-        self._targets = self._file['targets']  # HDF5 dataset (lazy)
+        self._inputs_ds  = self._file['inputs']   # HDF5 dataset handle
+        self._targets_ds = self._file['targets']  # HDF5 dataset handle
 
-        self.n_samples = self._inputs.shape[0]
-        self.N         = int(self._file.attrs.get('N', self._inputs.shape[2]))
+        self.n_samples = self._inputs_ds.shape[0]
+        self.N         = int(self._file.attrs.get('N', self._inputs_ds.shape[2]))
+
+        if preload:
+            # Bulk read: single contiguous HDF5 read is ~100x faster than
+            # n_samples individual reads.  80k × 5 × 512 × float32 ≈ 820 MB.
+            print(f"[QuantumDataset] Preloading {self.n_samples:,} samples into RAM "
+                  f"from {h5_path} ...", flush=True)
+            self._inputs_mem  = self._inputs_ds[:]   .astype(np.float32)  # (N,3,512)
+            self._targets_mem = self._targets_ds[:].astype(np.float32)  # (N,2,512)
+            mb = (self._inputs_mem.nbytes + self._targets_mem.nbytes) / 1024**2
+            print(f"[QuantumDataset] Preloaded {mb:.0f} MB into RAM.", flush=True)
+            # Close HDF5 — no longer needed
+            self._file.close()
+            self._file = None
+        else:
+            # Keep HDF5 open for lazy per-sample reads
+            self._inputs  = self._inputs_ds
+            self._targets = self._targets_ds
 
     # ------------------------------------------------------------------
     # Dataset protocol
@@ -450,14 +473,28 @@ class QuantumDataset(Dataset):
         y : torch.FloatTensor, shape (2, N)
             [Re(psi_{t+skip}), Im(psi_{t+skip})]
         """
-        # HDF5 -> NumPy (copies data from disk into RAM)
-        x = np.array(self._inputs [idx], dtype=np.float32)  # (3, N)
-        y = np.array(self._targets[idx], dtype=np.float32)  # (2, N)
+        # Fetch from RAM cache or HDF5
+        if self._preloaded:
+            x = self._inputs_mem [idx]   # already float32, shape (3, N)
+            y = self._targets_mem[idx]   # already float32, shape (2, N)
+        else:
+            x = np.array(self._inputs [idx], dtype=np.float32)  # (3, N)
+            y = np.array(self._targets[idx], dtype=np.float32)  # (2, N)
+
+        # Warn on near-zero delta (don't hard-assert to avoid DataLoader crashes)
+        delta = float(np.mean(np.abs(y - x[:2])))
+        if delta < 1e-6:
+            import warnings
+            warnings.warn(f"Sample {idx} has near-zero delta: {delta:.2e} — may be lazy.")
 
         # Spatial-flip augmentation with p=0.5
         if self.augment and np.random.random() < 0.5:
             x = x[:, ::-1].copy()   # flip all 3 channels along spatial axis
             y = y[:, ::-1].copy()   # flip both target channels
+        else:
+            # Ensure we return writable copies (not HDF5 views)
+            x = x.copy()
+            y = y.copy()
 
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -466,9 +503,12 @@ class QuantumDataset(Dataset):
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Explicitly close the underlying HDF5 file handle."""
-        if self._file.id.valid:
-            self._file.close()
+        """Explicitly close the underlying HDF5 file handle (no-op if preloaded)."""
+        try:
+            if self._file is not None and self._file.id.valid:
+                self._file.close()
+        except Exception:
+            pass  # Ignore errors during interpreter shutdown
 
     def __del__(self) -> None:
         self.close()
@@ -497,8 +537,8 @@ if __name__ == '__main__':
     gen = TrajectoryGenerator(
         N=512,
         L=1.0,
-        dt=1e-5,
-        skip=5,
+        dt=2e-5,
+        skip=10,
         seed=42,        # reproducible run when called directly
     )
 

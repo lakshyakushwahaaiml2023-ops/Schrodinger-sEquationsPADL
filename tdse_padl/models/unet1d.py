@@ -343,18 +343,21 @@ class PhysicsAwareLoss(nn.Module):
         lambda_norm: float = 1.0,
         lambda_l1:   float = 1.0,
         lambda_grad: float = 0.5,
+        lambda_delta: float = 2.0,
     ) -> None:
         super().__init__()
-        self.dx          = dx
-        self.lambda_norm = lambda_norm
-        self.lambda_l1   = lambda_l1
-        self.lambda_grad = lambda_grad
+        self.dx           = dx
+        self.lambda_norm  = lambda_norm
+        self.lambda_l1    = lambda_l1
+        self.lambda_grad  = lambda_grad
+        self.lambda_delta = lambda_delta
 
     def forward(
         self,
         pred:          torch.Tensor,   # (B, 2, N)
         target:        torch.Tensor,   # (B, 2, N)
         V_normalized:  torch.Tensor,   # (B, N)  — unused here, kept for API
+        input_psi:     torch.Tensor,   # (B, 2, N)
     ) -> dict[str, torch.Tensor]:
         """
         Compute all loss components.
@@ -366,13 +369,13 @@ class PhysicsAwareLoss(nn.Module):
         target : torch.Tensor, shape (B, 2, N)
             Ground-truth wavefunction [Re(ψ_true), Im(ψ_true)].
         V_normalized : torch.Tensor, shape (B, N)
-            Normalised potential (passed through for API completeness;
-            currently not used in the loss but available for future
-            potential-weighted losses).
+            Normalised potential.
+        input_psi : torch.Tensor, shape (B, 2, N)
+            Input wavefunction [Re(ψ_in), Im(ψ_in)].
 
         Returns
         -------
-        dict with keys 'l1', 'norm', 'grad', 'total'
+        dict with keys 'l1', 'norm', 'grad', 'delta', 'total'
             Each value is a scalar tensor with gradient.
         """
         # ------------------------------------------------------------------
@@ -397,18 +400,27 @@ class PhysicsAwareLoss(nn.Module):
         grad_loss   = F.l1_loss(pred_grad, target_grad)
 
         # ------------------------------------------------------------------
+        # 4. Delta loss (forces model to learn the dynamics / change)
+        # ------------------------------------------------------------------
+        pred_delta   = pred - input_psi
+        target_delta = target - input_psi
+        delta_loss   = F.l1_loss(pred_delta, target_delta)
+
+        # ------------------------------------------------------------------
         # Total weighted loss
         # ------------------------------------------------------------------
         total = (
             self.lambda_l1  * l1_loss
             + self.lambda_norm * norm_loss
             + self.lambda_grad * grad_loss
+            + self.lambda_delta * delta_loss
         )
 
         return {
             'l1':    l1_loss,
             'norm':  norm_loss,
             'grad':  grad_loss,
+            'delta': delta_loss,
             'total': total,
         }
 
@@ -461,12 +473,13 @@ if __name__ == '__main__':
     loss_fn = PhysicsAwareLoss(dx=1.0/512,
                                lambda_norm=1.0,
                                lambda_l1=1.0,
-                               lambda_grad=0.5)
+                               lambda_grad=0.5,
+                               lambda_delta=2.0)
     target  = torch.randn(2, 2, 512)
     V       = torch.zeros(2, 512)
 
     with torch.no_grad():
-        losses = loss_fn(out, target, V)
+        losses = loss_fn(out, target, V, x[:, :2, :])
 
     print("\n  Loss components:")
     for k, v in losses.items():
@@ -487,7 +500,7 @@ if __name__ == '__main__':
     out_grad = model(x_grad)
     tgt_grad = torch.randn(2, 2, 512)
     V_grad   = torch.zeros(2, 512)
-    loss_dict = loss_fn(out_grad, tgt_grad, V_grad)
+    loss_dict = loss_fn(out_grad, tgt_grad, V_grad, x_grad[:, :2, :])
     loss_dict['total'].backward()
 
     max_grad = max(

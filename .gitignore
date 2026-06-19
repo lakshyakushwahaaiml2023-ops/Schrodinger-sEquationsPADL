@@ -5,4 +5,8 @@ __pycache__/
 data/*.h5
 !data/smoke.h5
 
+checkpoints/*.pt
+checkpoints/*.png
+results/
+
 *.log

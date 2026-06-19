@@ -69,7 +69,7 @@ def make_dataloader(
     shuffle: bool,
 ) -> DataLoader:
     """Build a DataLoader from an HDF5 dataset file."""
-    dataset = QuantumDataset(h5_path, augment=augment)
+    dataset = QuantumDataset(h5_path, augment=augment, preload=True)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -87,21 +87,21 @@ def cosine_warmup_schedule(
     total_epochs: int,
 ) -> LambdaLR:
     """
-    Linear warm-up then cosine annealing learning-rate schedule.
-
-    During the first `warmup_epochs` epochs the LR increases linearly from
-    0 to its base value.  Afterwards it decays following a cosine curve down
-    to 0 at `total_epochs`.
+    Linear warm-up (5 epochs) then cosine annealing decaying to 0.01.
     """
     import math
 
     def lr_lambda(epoch: int) -> float:
         if epoch < warmup_epochs:
-            return float(epoch + 1) / float(warmup_epochs + 1)
-        progress = float(epoch - warmup_epochs) / float(
-            max(1, total_epochs - warmup_epochs)
-        )
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Linear warmup from 1/warmup_epochs to 1.0
+            return float(epoch + 1) / float(warmup_epochs)
+        
+        # Cosine decay from 1.0 to 0.01
+        # We want progress to be 1.0 at epoch = total_epochs - 1
+        progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - 1 - warmup_epochs))
+        progress = min(max(progress, 0.0), 1.0)
+        cos_val = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.01 + 0.99 * cos_val
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -131,19 +131,21 @@ def train_epoch(
     Returns averaged loss components as a plain dict of floats.
     """
     model.train()
-    totals: dict[str, float] = {'l1': 0., 'norm': 0., 'grad': 0., 'total': 0.}
+    totals: dict[str, float] = {'l1': 0., 'norm': 0., 'grad': 0., 'delta': 0., 'total': 0.}
     n_batches = 0
 
-    for x, y in loader:
+    pbar = tqdm(loader, desc='  train', leave=False, dynamic_ncols=True)
+    for x, y in pbar:
         x = x.to(device, non_blocking=True)   # (B, 3, N)
         y = y.to(device, non_blocking=True)   # (B, 2, N)
         V = x[:, 2, :]                        # (B, N) — potential channel
+        input_psi = x[:, :2, :]
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, enabled=use_amp):
             pred   = model(x)                 # (B, 2, N)
-            losses = loss_fn(pred, y, V)
+            losses = loss_fn(pred, y, V, input_psi)
 
         scaler.scale(losses['total']).backward()
         scaler.unscale_(optimizer)
@@ -165,30 +167,45 @@ def val_epoch(
     loss_fn: PhysicsAwareLoss,
     device:  torch.device,
     use_amp: bool,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], float]:
     """
     Run one full validation epoch (no gradients).
 
-    Returns averaged loss components.
+    Returns averaged loss components and the delta_ratio.
     """
     model.eval()
-    totals: dict[str, float] = {'l1': 0., 'norm': 0., 'grad': 0., 'total': 0.}
+    totals: dict[str, float] = {'l1': 0., 'norm': 0., 'grad': 0., 'delta': 0., 'total': 0.}
     n_batches = 0
+
+    pred_delta_accum = 0.0
+    target_delta_accum = 0.0
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         V = x[:, 2, :]
+        input_psi = x[:, :2, :]
 
         with autocast(device_type=device.type, enabled=use_amp):
             pred   = model(x)
-            losses = loss_fn(pred, y, V)
+            losses = loss_fn(pred, y, V, input_psi)
 
         for k in totals:
             totals[k] += losses[k].item()
+
+        # Accumulate mean absolute values of delta
+        pred_delta = torch.mean(torch.abs(pred - input_psi)).item()
+        target_delta = torch.mean(torch.abs(y - input_psi)).item()
+        pred_delta_accum += pred_delta
+        target_delta_accum += target_delta
+
         n_batches += 1
 
-    return {k: v / n_batches for k, v in totals.items()}
+    mean_pred_delta = pred_delta_accum / n_batches
+    mean_target_delta = target_delta_accum / n_batches
+    delta_ratio = mean_pred_delta / mean_target_delta if mean_target_delta > 0 else 0.0
+
+    return {k: v / n_batches for k, v in totals.items()}, delta_ratio
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +281,7 @@ def train(args: argparse.Namespace) -> None:
         lambda_l1=args.lambda_l1,
         lambda_norm=args.lambda_norm,
         lambda_grad=args.lambda_grad,
+        lambda_delta=2.0,
     )
     scaler = GradScaler(device.type, enabled=use_amp)
 
@@ -300,7 +318,7 @@ def train(args: argparse.Namespace) -> None:
         train_losses = train_epoch(
             model, train_loader, optimizer, loss_fn, device, scaler, use_amp
         )
-        val_losses = val_epoch(
+        val_losses, delta_ratio = val_epoch(
             model, val_loader, loss_fn, device, use_amp
         )
 
@@ -321,6 +339,18 @@ def train(args: argparse.Namespace) -> None:
             f"{val_losses['grad']:>8.5f}  "
             f"{elapsed:>5.1f}s"
         )
+        print(f"  --> Delta ratio: {delta_ratio:.4f} (want: close to 1.0)")
+
+        # Dynamic adjustments
+        if epoch > 5 and delta_ratio < 0.3:
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group['lr'] *= 2.0
+                scheduler.base_lrs[i] *= 2.0
+            print(f"  [!] Delta ratio {delta_ratio:.4f} < 0.3: Doubled learning rate to {optimizer.param_groups[0]['lr']:.2e} (and updated base_lrs)")
+
+        if delta_ratio > 3.0:
+            loss_fn.lambda_delta = 1.0
+            print("  [!] Delta ratio > 3.0: Reduced lambda_delta to 1.0")
 
         # --- CSV log ---
         log_writer.writerow({
@@ -388,7 +418,7 @@ def parse_args() -> argparse.Namespace:
     # training
     p.add_argument('--epochs',  default=100, type=int,             help='Number of training epochs')
     p.add_argument('--batch',   default=64,  type=int,             help='Batch size')
-    p.add_argument('--lr',      default=3e-4, type=float,          help='Base learning rate (AdamW)')
+    p.add_argument('--lr',      default=1e-3, type=float,          help='Base learning rate (AdamW)')
     p.add_argument('--weight-decay', default=1e-4, type=float,     help='AdamW weight decay')
     p.add_argument('--warmup',  default=5,   type=int,             help='Linear warm-up epochs')
     p.add_argument('--patience',default=20,  type=int,             help='Early-stop patience (0=off)')

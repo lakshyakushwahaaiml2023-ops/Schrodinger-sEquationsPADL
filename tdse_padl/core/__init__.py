@@ -1,8 +1,8 @@
 """
 tdse_padl.core
 ==============
-Core physics engine: Crank-Nicolson solver, wavepacket generation, and
-potential definitions for the 1D Time-Dependent Schrödinger Equation.
+Core physics engine: Crank-Nicolson solver, wavepacket generation,
+potential definitions, and the PADL hybrid solver.
 """
 
 from .solver import CrankNicolsonSolver
@@ -13,6 +13,7 @@ from .potential import (
     double_barrier,
     zero_potential,
 )
+from .padl_solver import PADLSolver, Benchmarker
 
 __all__ = [
     "CrankNicolsonSolver",
@@ -21,4 +22,6 @@ __all__ = [
     "rectangular_well",
     "double_barrier",
     "zero_potential",
+    "PADLSolver",
+    "Benchmarker",
 ]

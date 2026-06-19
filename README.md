@@ -46,6 +46,14 @@ Below is the evaluation summary of the PADL solver benchmarked against pure Cran
 
 ---
 
+## Test results
+The latest local verification completed successfully:
+
+* `python -m tdse_padl.main --demo` exited with code `0` on 2026-06-19.
+* This exercises the interactive demo path and the current hybrid solver stack end to end.
+
+---
+
 ## How to run
 
 ### 1. Install dependencies

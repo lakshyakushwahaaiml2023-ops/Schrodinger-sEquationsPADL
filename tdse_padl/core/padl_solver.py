@@ -402,7 +402,8 @@ if __name__ == '__main__':
     V = rectangular_barrier(N, L, center=0.6, width=0.05, height=200)
     psi0 = gaussian_wavepacket(N, L, x0=0.25, k0=50, sigma=0.05)
 
-    cn = CrankNicolsonSolver(N=N, L=L, dt=1e-5, V=V)
+    # dt=2e-5 matches the new training data (skip=10, dt=2e-5 => effective dt_eff=2e-4)
+    cn = CrankNicolsonSolver(N=N, L=L, dt=2e-5, V=V)
 
     # Load trained model
     ckpt = torch.load('checkpoints/best.pt', map_location='cpu', weights_only=True)
@@ -410,10 +411,10 @@ if __name__ == '__main__':
     model.load_state_dict(ckpt['model_state'])
     model.eval()
 
-    # model_skip=5 matches the skip=5 used during training data generation
-    padl = PADLSolver(cn, model, device='cpu', physics_interval=5, model_skip=5)
+    # model_skip=10 matches the skip=10 used during training data generation
+    padl = PADLSolver(cn, model, device='cpu', physics_interval=5, model_skip=10)
     bench = Benchmarker()
-    # n_steps=1000 CN-equivalent steps; PADL runs 200 blocks of 5 steps each
+    # n_steps=1000 CN-equivalent steps; PADL runs 100 blocks of 10 steps each
     results = bench.compare(psi0, V, cn_solver=cn, padl_solver=padl, n_steps=1000)
 
     print(f"\n{'='*40}")
